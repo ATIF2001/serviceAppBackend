@@ -2,13 +2,16 @@ const { Booking, Service, User } = require('../models');
 const { sendSuccess, sendError } = require('../utils/response');
 
 const createBooking = async (req, res) => {
-  const { serviceId, bookingDate, bookingTime, address, notes } = req.body;
+  const { userId, serviceId, bookingDate, bookingTime, address, notes } = req.body;
+  if (!userId) return sendError(res, 'userId is required', 400);
   const service = await Service.findByPk(serviceId, { include: [{ model: User, as: 'provider' }] });
   if (!service) return sendError(res, 'Service not found', 404);
+  const user = await User.findByPk(userId);
+  if (!user) return sendError(res, 'User not found', 404);
 
   const totalPrice = Number(service.discountedPrice || service.price);
   const booking = await Booking.create({
-    userId: req.user.id,
+    userId,
     serviceId: service.id,
     providerId: service.providerId,
     bookingDate,
@@ -23,8 +26,10 @@ const createBooking = async (req, res) => {
 };
 
 const getMyBookings = async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return sendError(res, 'userId is required', 400);
   const bookings = await Booking.findAll({
-    where: { userId: req.user.id },
+    where: { userId },
     include: [{ model: Service, as: 'service' }, { model: User, as: 'provider', attributes: ['id', 'name', 'phone', 'profileImage'] }],
     order: [['createdAt', 'DESC']]
   });

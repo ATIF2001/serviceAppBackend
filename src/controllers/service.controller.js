@@ -1,6 +1,19 @@
 const { Op } = require('sequelize');
 const { Service, User, Category, Review, RecentlyViewed, Booking } = require('../models');
 const { sendSuccess, sendError } = require('../utils/response');
+const { s3, getFileUrl } = require('../config/s3');
+const env = require('../config/env');
+
+const uploadBufferToS3 = async (file, folder) => {
+  const key = `${folder}/${Date.now()}-${file.originalname}`;
+  const result = await s3.upload({
+    Bucket: env.aws.bucket,
+    Key: key,
+    Body: file.buffer,
+    ContentType: file.mimetype
+  }).promise();
+  return getFileUrl(result.Key);
+};
 
 const buildSort = sortBy => {
   if (sortBy === 'price_asc') return [['price', 'ASC']];
@@ -43,7 +56,7 @@ const getServices = async (req, res) => {
   const { rows, count } = await Service.findAndCountAll({
     where,
     include: [
-      { model: Category, as: 'category' },
+      { model: Category, as: 'category', attributes: ['id', 'name', ['icon', 'logo']] },
       { model: User, as: 'provider', attributes: ['id', 'name', 'profileImage', 'phone', 'address'] },
       { model: Review, as: 'reviews', attributes: ['id', 'rating'] }
     ],
@@ -77,7 +90,7 @@ const searchServices = async (req, res) => {
 const getServiceById = async (req, res) => {
   const service = await Service.findByPk(req.params.id, {
     include: [
-      { model: Category, as: 'category' },
+      { model: Category, as: 'category', attributes: ['id', 'name', ['icon', 'logo']] },
       { model: User, as: 'provider', attributes: ['id', 'name', 'profileImage', 'phone', 'address'] },
       { model: Review, as: 'reviews', include: [{ model: User, as: 'user', attributes: ['id', 'name', 'profileImage'] }] }
     ]
@@ -121,7 +134,9 @@ const getFeaturedServices = async (req, res) => {
 };
 
 const getRecommendedServices = async (req, res) => {
-  const recent = await RecentlyViewed.findAll({ where: { userId: req.user.id }, limit: 10 });
+  const userId = req.query.userId;
+  if (!userId) return sendError(res, 'userId is required', 400);
+  const recent = await RecentlyViewed.findAll({ where: { userId }, limit: 10 });
   const ids = recent.map(r => r.serviceId);
 
   const baseServices = ids.length ? await Service.findAll({ where: { id: ids } }) : [];
@@ -137,8 +152,10 @@ const getRecommendedServices = async (req, res) => {
 };
 
 const getRecentlyViewed = async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return sendError(res, 'userId is required', 400);
   const items = await RecentlyViewed.findAll({
-    where: { userId: req.user.id },
+    where: { userId },
     include: [{ model: Service }],
     order: [['createdAt', 'DESC']],
     limit: 20
@@ -158,17 +175,105 @@ const checkAvailability = async (req, res) => {
 };
 
 const createService = async (req, res) => {
+  const toArray = value => {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return [];
+      if (trimmed.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          return Array.isArray(parsed) ? parsed : [trimmed];
+        } catch (error) {
+          return trimmed.split(',').map(v => v.trim()).filter(Boolean);
+        }
+      }
+      return trimmed.split(',').map(v => v.trim()).filter(Boolean);
+    }
+    if (value == null) return [];
+    return [value];
+  };
+
   const payload = { ...req.body, providerId: req.body.providerId || req.user?.id || null };
+  payload.tags = toArray(req.body.tags);
+  if (payload.isFeatured !== undefined) payload.isFeatured = String(payload.isFeatured) === 'true';
+  if (payload.isActive !== undefined) payload.isActive = String(payload.isActive) === 'true';
+  if (payload.price !== undefined) payload.price = Number(payload.price);
+  if (payload.discountedPrice !== undefined && payload.discountedPrice !== '') payload.discountedPrice = Number(payload.discountedPrice);
+
   if (req.files?.length) {
-    payload.images = req.files.map(file => file.originalname);
+    payload.images = await Promise.all(req.files.map(file => uploadBufferToS3(file, 'uploads')));
   }
+  const provider = await User.findOne({ where: { id: payload.providerId, role: 'provider' } });
+  if (!provider) return sendError(res, 'Provider not found. Use a valid providerId.', 400);
+
+  const categoryIds = req.body.categoryIds
+    ? toArray(req.body.categoryIds)
+    : req.body.categoryId
+      ? [req.body.categoryId]
+      : [];
+
+  let categories = [];
+  if (categoryIds.length) {
+    categories = await Category.findAll({ where: { id: { [Op.in]: categoryIds } } });
+    if (categories.length !== categoryIds.length) {
+      return sendError(res, 'One or more categoryIds are invalid', 400);
+    }
+    payload.categoryId = categories[0].id;
+  }
+
   const service = await Service.create(payload);
-  const fullService = await Service.findByPk(service.id, { include: [{ model: Category, as: 'category' }] });
+  if (categories.length) {
+    await service.setCategories(categories);
+  }
+
+  const fullService = await Service.findByPk(service.id, {
+    include: [{ model: Category, as: 'category', attributes: ['id', 'name', ['icon', 'logo']] }]
+  });
   return sendSuccess(res, 'Service created successfully', fullService, 201);
+};
+
+const updateService = async (req, res) => {
+  const service = await Service.findByPk(req.params.id);
+  if (!service) return sendError(res, 'Service not found', 404);
+
+  const payload = { ...req.body };
+  if (payload.isFeatured !== undefined) payload.isFeatured = String(payload.isFeatured) === 'true' || payload.isFeatured === true;
+  if (payload.isActive !== undefined) payload.isActive = String(payload.isActive) === 'true' || payload.isActive === true;
+  if (payload.price !== undefined) payload.price = Number(payload.price);
+  if (payload.discountedPrice !== undefined && payload.discountedPrice !== '') payload.discountedPrice = Number(payload.discountedPrice);
+
+  if (req.files?.length) {
+    payload.images = await Promise.all(req.files.map(file => uploadBufferToS3(file, 'uploads')));
+  }
+
+  if (payload.providerId) {
+    const provider = await User.findOne({ where: { id: payload.providerId, role: 'provider' } });
+    if (!provider) return sendError(res, 'Provider not found. Use a valid providerId.', 400);
+  }
+
+  await service.update(payload);
+
+  const fullService = await Service.findByPk(service.id, {
+    include: [{ model: Category, as: 'category', attributes: ['id', 'name', ['icon', 'logo']] }]
+  });
+  return sendSuccess(res, 'Service updated successfully', fullService);
+};
+
+const deleteService = async (req, res) => {
+  const service = await Service.findByPk(req.params.id);
+  if (!service) return sendError(res, 'Service not found', 404);
+
+  service.isActive = false;
+  await service.save();
+
+  return sendSuccess(res, 'Service deleted successfully', { id: service.id, isActive: service.isActive });
 };
 
 module.exports = {
   createService,
+  updateService,
+  deleteService,
   getServices,
   searchServices,
   getServiceById,

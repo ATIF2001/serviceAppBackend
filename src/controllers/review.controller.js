@@ -1,13 +1,19 @@
-const { Review, Service, Booking, User } = require('../models');
+const { Review, Service, User } = require('../models');
 const { sendSuccess, sendError } = require('../utils/response');
 
 const createReview = async (req, res) => {
-  const { serviceId, rating, comment } = req.body;
+  const { serviceId, rating, comment, reviewerName, reviewerImage, userId } = req.body;
+  const service = await Service.findByPk(serviceId);
+  if (!service) return sendError(res, 'Service not found', 404);
 
-  const booking = await Booking.findOne({ where: { userId: req.user.id, serviceId, status: 'completed' } });
-  if (!booking) return sendError(res, 'You can review only after completed booking', 400);
-
-  const review = await Review.create({ userId: req.user.id, serviceId, rating, comment });
+  const review = await Review.create({
+    userId: userId || null,
+    serviceId,
+    reviewerName: reviewerName || null,
+    reviewerImage: reviewerImage || null,
+    rating,
+    comment
+  });
 
   const reviews = await Review.findAll({ where: { serviceId } });
   const totalReviews = reviews.length;
@@ -25,7 +31,20 @@ const getServiceReviews = async (req, res) => {
     order: [['createdAt', 'DESC']]
   });
 
-  return sendSuccess(res, 'Reviews fetched successfully', reviews);
+  const mapped = reviews.map(review => {
+    const plain = review.toJSON();
+    return {
+      id: plain.id,
+      serviceId: plain.serviceId,
+      reviewerName: plain.reviewerName || plain.user?.name || null,
+      reviewerImage: plain.reviewerImage || plain.user?.profileImage || null,
+      rating: plain.rating,
+      comment: plain.comment,
+      createdAt: plain.createdAt
+    };
+  });
+
+  return sendSuccess(res, 'Reviews fetched successfully', mapped);
 };
 
 module.exports = { createReview, getServiceReviews };
